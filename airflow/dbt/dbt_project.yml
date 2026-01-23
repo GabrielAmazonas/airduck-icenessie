@@ -1,0 +1,61 @@
+# =============================================================================
+# Airduck-IceNessie Transforms - dbt Project Configuration
+# =============================================================================
+# Transforms raw data through Bronze → Silver → Gold medallion architecture
+# for vector embedding and RAG applications.
+# =============================================================================
+
+name: 'airduck_transforms'
+version: '1.0.0'
+config-version: 2
+
+profile: 'trino_iceberg'
+
+# Paths
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Variables
+vars:
+  # Content filtering
+  min_content_length: 50
+  max_content_length: 10000
+  
+  # Quality scoring
+  min_quality_score: 0.5
+  
+  # Chunking configuration
+  chunk_size: 1000
+  chunk_overlap: 100
+  
+  # Embedding configuration (for reference)
+  embedding_model: "all-MiniLM-L6-v2"
+  embedding_dim: 384
+
+# Model configurations
+models:
+  airduck_transforms:
+    # Bronze: Source definitions only (ephemeral)
+    bronze:
+      +materialized: ephemeral
+      +schema: bronze
+    
+    # Silver: Incremental deduplication
+    silver:
+      +materialized: incremental
+      +schema: silver
+      +on_schema_change: sync_all_columns
+    
+    # Gold: Full refresh for vector-ready data
+    gold:
+      +materialized: table
+      +schema: gold
+

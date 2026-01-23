@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: gold_documents
+    description: "Chunked and scored documents ready for vector embedding"
+    columns:
+      - name: id
+        description: "Chunk ID in format: original_id-chunk_index"
+        tests:
+          - not_null
+          - unique
+      
+      - name: content
+        description: "Document chunk content"
+        tests:
+          - not_null
+      
+      - name: chunk_index
+        description: "Index of this chunk within the original document (1-based)"
+        tests:
+          - not_null
+      
+      - name: total_chunks
+        description: "Total number of chunks for the original document"
+        tests:
+          - not_null
+      
+      - name: metadata
+        description: "Original document metadata"
+      
+      - name: source
+        description: "Origin of the document"
+      
+      - name: original_content_hash
+        description: "Hash of the original (pre-chunked) content"
+      
+      - name: embedding
+        description: "Vector embedding (NULL until computed by DuckDB/FastAPI)"
+      
+      - name: quality_score
+        description: "Computed quality score between 0.0 and 1.0"
+        tests:
+          - not_null
+      
+      - name: ready_at
+        description: "Timestamp when this record was created"
+        tests:
+          - not_null
+

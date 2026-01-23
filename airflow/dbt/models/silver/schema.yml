@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: silver_documents
+    description: "Deduplicated and cleaned documents ready for transformation"
+    columns:
+      - name: id
+        description: "Original document ID"
+        tests:
+          - not_null
+      
+      - name: content
+        description: "Cleaned document content"
+        tests:
+          - not_null
+      
+      - name: content_hash
+        description: "SHA256 hash of normalized content for deduplication"
+        tests:
+          - not_null
+          - unique
+      
+      - name: source
+        description: "Origin of the document"
+      
+      - name: metadata
+        description: "Parsed metadata as MAP"
+      
+      - name: processed_at
+        description: "Timestamp when record was processed"
+        tests:
+          - not_null
+

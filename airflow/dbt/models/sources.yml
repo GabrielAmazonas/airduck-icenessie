@@ -1,0 +1,30 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: "Raw data ingested from external sources"
+    database: iceberg
+    schema: bronze
+    tables:
+      - name: raw_documents
+        description: "Raw documents as ingested from APIs or files"
+        columns:
+          - name: id
+            description: "Document unique identifier"
+            tests:
+              - not_null
+          - name: content
+            description: "Document text content"
+            tests:
+              - not_null
+          - name: source
+            description: "Origin of the document (api, file, etc)"
+          - name: ingested_at
+            description: "Timestamp when document was ingested"
+          - name: raw_metadata
+            description: "JSON string containing document metadata"
+        freshness:
+          warn_after: {count: 24, period: hour}
+          error_after: {count: 48, period: hour}
+        loaded_at_field: ingested_at
+

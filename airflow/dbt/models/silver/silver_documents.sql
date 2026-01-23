@@ -1,0 +1,54 @@
+{{
+  config(
+    materialized='incremental',
+    unique_key='content_hash',
+    incremental_strategy='merge',
+    file_format='parquet'
+  )
+}}
+
+/*
+ * Silver Layer: Deduplicated and Cleaned Documents
+ * ================================================
+ * - Removes duplicate content via SHA256 hash
+ * - Filters by content length
+ * - Parses metadata from JSON string
+ */
+
+WITH raw AS (
+    SELECT 
+        id,
+        content,
+        source,
+        raw_metadata as metadata,
+        ingested_at,
+        -- Deduplication hash (case-insensitive, trimmed)
+        TO_HEX(SHA256(TO_UTF8(LOWER(TRIM(content))))) as content_hash
+    FROM {{ source('bronze', 'raw_documents') }}
+    {% if is_incremental() %}
+    WHERE ingested_at > (SELECT COALESCE(MAX(processed_at), TIMESTAMP '1970-01-01') FROM {{ this }})
+    {% endif %}
+),
+
+deduplicated AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY content_hash 
+            ORDER BY ingested_at DESC
+        ) as rn
+    FROM raw
+)
+
+SELECT 
+    id,
+    content,
+    content_hash,
+    source,
+    metadata,
+    CURRENT_TIMESTAMP as processed_at
+FROM deduplicated
+WHERE rn = 1
+  AND LENGTH(content) >= {{ var('min_content_length') }}
+  AND LENGTH(content) <= {{ var('max_content_length') }}
+

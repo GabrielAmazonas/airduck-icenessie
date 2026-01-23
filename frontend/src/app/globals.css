@@ -1,0 +1,116 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 8 10 15;
+    --foreground: 248 250 252;
+    --card: 15 23 42;
+    --card-foreground: 248 250 252;
+    --primary: 14 165 233;
+    --primary-foreground: 255 255 255;
+    --secondary: 30 41 59;
+    --secondary-foreground: 248 250 252;
+    --accent: 217 70 239;
+    --accent-foreground: 255 255 255;
+    --muted: 51 65 85;
+    --muted-foreground: 148 163 184;
+    --border: 51 65 85;
+    --ring: 14 165 233;
+  }
+
+  * {
+    @apply border-dark-700;
+  }
+
+  body {
+    @apply bg-dark-950 text-dark-50;
+    background-image: 
+      radial-gradient(ellipse 80% 80% at 50% -20%, rgba(14, 165, 233, 0.15), transparent),
+      radial-gradient(ellipse 60% 60% at 100% 100%, rgba(217, 70, 239, 0.1), transparent);
+    min-height: 100vh;
+  }
+}
+
+@layer components {
+  .search-input {
+    @apply w-full px-6 py-4 bg-dark-900/80 border border-dark-700 rounded-2xl
+           text-dark-50 placeholder:text-dark-500
+           focus:outline-none focus:ring-2 focus:ring-primary-500/50 focus:border-primary-500
+           transition-all duration-300 backdrop-blur-sm;
+  }
+
+  .btn-primary {
+    @apply px-6 py-3 bg-gradient-to-r from-primary-500 to-primary-600 
+           text-white font-medium rounded-xl
+           hover:from-primary-400 hover:to-primary-500
+           focus:outline-none focus:ring-2 focus:ring-primary-500/50
+           transition-all duration-300 shadow-lg shadow-primary-500/25
+           hover:shadow-xl hover:shadow-primary-500/30
+           active:scale-[0.98];
+  }
+
+  .btn-secondary {
+    @apply px-6 py-3 bg-dark-800 border border-dark-700
+           text-dark-200 font-medium rounded-xl
+           hover:bg-dark-700 hover:border-dark-600
+           focus:outline-none focus:ring-2 focus:ring-dark-500/50
+           transition-all duration-300;
+  }
+
+  .card {
+    @apply bg-dark-900/60 border border-dark-800 rounded-2xl
+           backdrop-blur-md shadow-xl;
+  }
+
+  .result-card {
+    @apply card p-6 hover:bg-dark-800/60 hover:border-dark-700
+           transition-all duration-300 cursor-pointer
+           hover:shadow-2xl hover:shadow-primary-500/5;
+  }
+
+  .glass {
+    @apply bg-dark-900/40 backdrop-blur-xl border border-dark-700/50;
+  }
+
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary-400 via-accent-400 to-primary-400 
+           bg-clip-text text-transparent bg-[length:200%_auto]
+           animate-[gradient_3s_linear_infinite];
+  }
+}
+
+@keyframes gradient {
+  0% { background-position: 0% center; }
+  100% { background-position: 200% center; }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgb(15 23 42);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(51 65 85);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(71 85 105);
+}
+
+/* Selection */
+::selection {
+  background: rgba(14, 165, 233, 0.3);
+  color: white;
+}
+
+
+
+
