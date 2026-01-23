@@ -48,6 +48,11 @@ Thumbs.db
 # Docker
 *.log
 
+# MinIO
+minio-data/
+minio-data/.minio.sys/
+.minio.sys/
+
 # DuckDB
 *.duckdb
 *.duckdb.wal
