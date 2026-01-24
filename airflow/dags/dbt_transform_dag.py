@@ -99,7 +99,7 @@ def ensure_iceberg_schemas(**context):
 
 
 def create_bronze_table_if_not_exists(**context):
-    """Create the Bronze raw_documents table if it doesn't exist."""
+    """Create the Bronze schema and raw_documents table if they don't exist."""
     import trino
     
     conn = trino.dbapi.connect(
@@ -107,13 +107,20 @@ def create_bronze_table_if_not_exists(**context):
         port=int(TRINO_PORT),
         user="airflow",
         catalog="iceberg",
-        schema="bronze"
     )
     cursor = conn.cursor()
     
+    # Create schemas if they don't exist
+    for schema_name in ['bronze', 'silver', 'gold']:
+        try:
+            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS iceberg.{schema_name}")
+            print(f"✓ Schema iceberg.{schema_name} ensured")
+        except Exception as e:
+            print(f"Schema {schema_name} check: {e}")
+    
     # Check if table exists
     try:
-        cursor.execute("SELECT 1 FROM raw_documents LIMIT 1")
+        cursor.execute("SELECT 1 FROM iceberg.bronze.raw_documents LIMIT 1")
         cursor.fetchone()
         print("✓ Bronze raw_documents table already exists")
     except Exception:

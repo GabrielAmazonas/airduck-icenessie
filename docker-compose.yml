@@ -118,6 +118,32 @@ services:
     networks:
       - platform_net
 
+  # Iceberg schema initialization (rebuilds after Nessie restart)
+  iceberg-init:
+    image: trinodb/trino:439
+    container_name: airduck_iceberg_init
+    depends_on:
+      trino:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for Trino to be fully ready...';
+      sleep 5;
+      
+      echo 'Creating Iceberg schemas...';
+      
+      trino --server http://trino:8080 --execute \"CREATE SCHEMA IF NOT EXISTS iceberg.bronze\" || true;
+      trino --server http://trino:8080 --execute \"CREATE SCHEMA IF NOT EXISTS iceberg.silver\" || true;
+      trino --server http://trino:8080 --execute \"CREATE SCHEMA IF NOT EXISTS iceberg.gold\" || true;
+      
+      echo 'Iceberg schemas created: bronze, silver, gold';
+      echo 'Note: Run dbt_seed_bronze_data DAG to create tables with data';
+      "
+    networks:
+      - platform_net
+
   # ---------------------------------------------------------------------------
   # 2. DUCKDB SERVER (FlightSQL Protocol)
   # ---------------------------------------------------------------------------
@@ -305,8 +331,8 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-      trino:
-        condition: service_started
+      iceberg-init:
+        condition: service_completed_successfully
     restart: on-failure
 
   airflow-scheduler:
@@ -316,6 +342,6 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-      trino:
-        condition: service_started
+      iceberg-init:
+        condition: service_completed_successfully
     restart: on-failure

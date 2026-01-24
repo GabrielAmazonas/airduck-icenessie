@@ -101,6 +101,7 @@ class SearchQuery(BaseModel):
     query: str
     top_k: int = 10
     use_vector: bool = True  # Use vector search by default
+    use_hnsw: bool = False  # Use HNSW index if available (requires reindex DAG to have run)
 
 
 class SearchResult(BaseModel):
@@ -309,28 +310,56 @@ async def search_documents(query: SearchQuery):
     Search for documents using vector similarity.
     
     - Automatically generates embedding from query text
-    - Uses HNSW index for fast approximate nearest neighbor search
-    - Falls back to text search if use_vector=False
+    - use_hnsw=True: Uses HNSW index for O(log n) approximate nearest neighbor search
+    - use_hnsw=False (default): Uses brute-force cosine similarity O(n)
+    - use_vector=False: Falls back to text search
+    
+    Note: HNSW requires the daily_reindex DAG to have run. Documents added via API
+    after the last reindex will NOT appear in HNSW results.
     """
     conn = get_db_connection()
     try:
         if query.use_vector:
             # Generate embedding for query
             query_embedding = generate_embedding(query.query)
-            
-            # Vector similarity search
             embedding_str = str(query_embedding)
-            results = conn.execute(f"""
-                SELECT 
-                    id, 
-                    content, 
-                    metadata,
-                    array_cosine_similarity(embedding, {embedding_str}::FLOAT[{EMBEDDING_DIM}]) as score
-                FROM documents
-                WHERE embedding IS NOT NULL
-                ORDER BY score DESC
-                LIMIT ?
-            """, [query.top_k]).fetchall()
+            
+            if query.use_hnsw:
+                # HNSW index search using array_cosine_distance
+                # This query pattern allows DuckDB to use the HNSW index
+                # Note: cosine distance = 1 - cosine_similarity (lower = more similar)
+                # so we convert to similarity score: 1 - distance
+                has_index = check_vector_index_exists(conn)
+                if not has_index:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="HNSW index not found. Run the daily_reindex DAG first, or use use_hnsw=false"
+                    )
+                
+                results = conn.execute(f"""
+                    SELECT 
+                        id, 
+                        content, 
+                        metadata,
+                        1 - array_cosine_distance(embedding, {embedding_str}::FLOAT[{EMBEDDING_DIM}]) as score
+                    FROM documents
+                    WHERE embedding IS NOT NULL
+                    ORDER BY array_cosine_distance(embedding, {embedding_str}::FLOAT[{EMBEDDING_DIM}])
+                    LIMIT ?
+                """, [query.top_k]).fetchall()
+            else:
+                # Brute-force cosine similarity (works without HNSW index)
+                results = conn.execute(f"""
+                    SELECT 
+                        id, 
+                        content, 
+                        metadata,
+                        array_cosine_similarity(embedding, {embedding_str}::FLOAT[{EMBEDDING_DIM}]) as score
+                    FROM documents
+                    WHERE embedding IS NOT NULL
+                    ORDER BY score DESC
+                    LIMIT ?
+                """, [query.top_k]).fetchall()
             
             return [
                 SearchResult(
@@ -626,6 +655,156 @@ async def generate_embedding_endpoint(text: str):
         "dim": len(embedding),
         "model": EMBEDDING_MODEL,
     }
+
+
+# ============================================================================
+# Iceberg/Trino Direct Query (Vector Search on Data Lake)
+# ============================================================================
+
+class IcebergSearchQuery(BaseModel):
+    """Iceberg search query model."""
+    query: str
+    top_k: int = 10
+    catalog: str = "iceberg"
+    schema_name: str = "silver_gold"  # dbt-trino creates schemas as {target}_{model_schema}
+    table: str = "gold_documents"
+
+
+def get_trino_connection():
+    """Get a Trino connection for Iceberg queries."""
+    import trino
+    
+    trino_host = os.getenv("TRINO_HOST", "trino")
+    trino_port = int(os.getenv("TRINO_PORT", "8080"))
+    
+    # Note: dbt-trino creates schemas as {target_schema}_{model_schema}
+    # So gold models end up in silver_gold schema
+    return trino.dbapi.connect(
+        host=trino_host,
+        port=trino_port,
+        user="fastapi",
+        catalog="iceberg",
+        schema="silver_gold",
+    )
+
+
+@app.post("/search/iceberg", response_model=List[SearchResult])
+async def search_iceberg_direct(query: IcebergSearchQuery):
+    """
+    Search directly on Iceberg tables via Trino using vector similarity.
+    
+    This queries the Gold layer in Iceberg, which has embeddings generated
+    by the embed_iceberg_gold DAG. Uses brute-force cosine similarity
+    computed in Trino SQL.
+    
+    Benefits:
+    - No separate DuckDB index needed
+    - Queries the source of truth (Iceberg)
+    - Scales with Trino workers
+    """
+    try:
+        # Generate embedding for query
+        query_embedding = generate_embedding(query.query)
+        
+        # Use JSON parse to avoid Trino ARRAY[] argument limit (384 dims is too many)
+        import json as json_module
+        embedding_json = json_module.dumps(query_embedding)
+        query_vec = f"CAST(json_parse('{embedding_json}') AS ARRAY(REAL))"
+        
+        conn = get_trino_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Cosine similarity in Trino SQL
+            # dot_product / (magnitude_a * magnitude_b)
+            sql = f"""
+                SELECT 
+                    id,
+                    content,
+                    CAST(metadata AS VARCHAR) as metadata,
+                    (
+                        reduce(
+                            zip_with(embedding, {query_vec}, (a, b) -> CAST(a AS DOUBLE) * CAST(b AS DOUBLE)),
+                            0.0,
+                            (s, x) -> s + x,
+                            s -> s
+                        )
+                    ) / NULLIF(
+                        sqrt(reduce(embedding, 0.0, (s, x) -> s + CAST(x AS DOUBLE) * CAST(x AS DOUBLE), s -> s)) *
+                        sqrt(reduce({query_vec}, 0.0, (s, x) -> s + CAST(x AS DOUBLE) * CAST(x AS DOUBLE), s -> s)),
+                        0.0
+                    ) as score
+                FROM {query.catalog}.{query.schema_name}.{query.table}
+                WHERE embedding IS NOT NULL
+                  AND cardinality(embedding) > 0
+                ORDER BY score DESC
+                LIMIT {query.top_k}
+            """
+            
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            
+            return [
+                SearchResult(
+                    id=str(row[0]),
+                    content=str(row[1]),
+                    metadata=parse_metadata(row[2]),
+                    score=float(row[3]) if row[3] else 0.0,
+                )
+                for row in results
+            ]
+            
+        finally:
+            cursor.close()
+            conn.close()
+            
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Iceberg search failed: {str(e)}"
+        )
+
+
+@app.get("/iceberg/status")
+async def get_iceberg_status():
+    """
+    Get the status of the Iceberg Gold table and embedding coverage.
+    """
+    try:
+        conn = get_trino_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(CASE WHEN embedding IS NOT NULL 
+                               AND cardinality(embedding) > 0 
+                          THEN 1 END) as with_embeddings
+                FROM iceberg.silver_gold.gold_documents
+            """)
+            
+            result = cursor.fetchone()
+            total, with_embeddings = result[0], result[1]
+            
+            return {
+                "status": "ready" if with_embeddings > 0 else "no_embeddings",
+                "total_documents": total,
+                "documents_with_embeddings": with_embeddings,
+                "embedding_coverage": f"{with_embeddings/total*100:.1f}%" if total > 0 else "0%",
+                "table": "iceberg.silver_gold.gold_documents",
+            }
+            
+        finally:
+            cursor.close()
+            conn.close()
+            
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "Iceberg table may not exist. Run dbt transforms first.",
+        }
 
 
 if __name__ == "__main__":
