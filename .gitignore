@@ -51,6 +51,8 @@ Thumbs.db
 # MinIO
 minio-data/
 minio-data/.minio.sys/
+minio-data/.minio.sys/buckets*
+minio-data/.minio.sys
 .minio.sys/
 
 # DuckDB
