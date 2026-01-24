@@ -40,6 +40,8 @@ x-airflow-common: &airflow-common
     TRINO_PORT: 8080
     TRINO_USER: airflow
     TRINO_CATALOG: iceberg
+    # FastAPI for embedding generation (offloads ML compute from Airflow)
+    FASTAPI_URL: http://fastapi:8000
     # DuckDB Server
     DUCKDB_SERVER: duckdb-server:8815
     # Iceberg source toggle (set to 'true' to read from Iceberg Gold layer)

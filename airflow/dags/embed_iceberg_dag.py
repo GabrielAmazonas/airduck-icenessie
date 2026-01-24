@@ -6,8 +6,14 @@ eliminating the need for a separate DuckDB index.
 
 Flow:
     1. Read Gold documents without embeddings from Iceberg (via Trino)
-    2. Generate embeddings using sentence-transformers
-    3. Write embeddings back to Iceberg (via PyIceberg)
+    2. Generate embeddings via FastAPI /embed endpoint (offloads compute to FastAPI container)
+    3. Write embeddings back to Iceberg (via Trino UPDATE)
+    4. Compact small files created by updates
+    5. Verify embedding coverage
+
+Architecture Note:
+    Embedding generation runs on the FastAPI container, not Airflow.
+    This avoids loading the model twice and centralizes ML compute.
 """
 from datetime import datetime, timedelta
 from airflow import DAG
@@ -18,14 +24,13 @@ import os
 TRINO_HOST = os.getenv("TRINO_HOST", "trino")
 TRINO_PORT = int(os.getenv("TRINO_PORT", "8080"))
 TRINO_USER = os.getenv("TRINO_USER", "airflow")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM = 384
 
-# S3/MinIO configuration for PyIceberg
-S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
-S3_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
-S3_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
-NESSIE_URI = os.getenv("NESSIE_URI", "http://nessie:19120/api/v1")
+# FastAPI endpoint for embedding generation
+FASTAPI_URL = os.getenv("FASTAPI_URL", "http://fastapi:8000")
+
+# Batch size for embedding requests
+EMBEDDING_BATCH_SIZE = 32
 
 
 def get_trino_connection():
@@ -79,9 +84,18 @@ def get_documents_without_embeddings(**context):
 
 def generate_embeddings(**context):
     """
-    Generate embeddings for documents using sentence-transformers.
+    Generate embeddings via FastAPI /embed/batch endpoint.
+    
+    This offloads embedding computation to the FastAPI container,
+    which already has the model loaded. Benefits:
+    - No model loading in Airflow container
+    - Centralized ML compute
+    - Reduced Airflow memory requirements
+    - Model stays warm in FastAPI for real-time requests
+    - Batch endpoint is more efficient than individual requests
     """
-    from sentence_transformers import SentenceTransformer
+    import requests
+    import time
     
     documents = context['task_instance'].xcom_pull(
         key='documents', 
@@ -92,23 +106,59 @@ def generate_embeddings(**context):
         print("No documents to embed")
         return []
     
-    print(f"Loading embedding model: {EMBEDDING_MODEL}...")
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    
-    # Extract content and generate embeddings
+    # Extract content
     ids = [doc[0] for doc in documents]
     contents = [doc[1] for doc in documents]
     
-    print(f"Generating embeddings for {len(contents)} documents...")
-    embeddings = model.encode(contents, convert_to_numpy=True, show_progress_bar=True)
+    print(f"Generating embeddings for {len(contents)} documents via FastAPI...")
+    print(f"Endpoint: {FASTAPI_URL}/embed/batch")
     
-    # Prepare results
-    results = [
-        {"id": doc_id, "embedding": emb.tolist()}
-        for doc_id, emb in zip(ids, embeddings)
-    ]
+    results = []
+    failed_batches = 0
     
-    print(f"Generated {len(results)} embeddings")
+    # Process in batches using the batch endpoint
+    for i in range(0, len(contents), EMBEDDING_BATCH_SIZE):
+        batch_ids = ids[i:i + EMBEDDING_BATCH_SIZE]
+        batch_contents = contents[i:i + EMBEDDING_BATCH_SIZE]
+        batch_num = i // EMBEDDING_BATCH_SIZE + 1
+        total_batches = (len(contents) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
+        
+        print(f"Processing batch {batch_num}/{total_batches} ({len(batch_contents)} docs)...")
+        
+        try:
+            response = requests.post(
+                f"{FASTAPI_URL}/embed/batch",
+                json={"texts": batch_contents},
+                timeout=120  # Longer timeout for batch
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                embeddings = data["embeddings"]
+                
+                for doc_id, embedding in zip(batch_ids, embeddings):
+                    results.append({
+                        "id": doc_id,
+                        "embedding": embedding
+                    })
+                    
+                print(f"  ✓ Batch {batch_num}: {len(embeddings)} embeddings generated")
+            else:
+                print(f"  ⚠ Batch {batch_num} failed: HTTP {response.status_code}")
+                failed_batches += 1
+                
+        except requests.exceptions.Timeout:
+            print(f"  ⚠ Batch {batch_num} timed out")
+            failed_batches += 1
+        except requests.exceptions.RequestException as e:
+            print(f"  ⚠ Batch {batch_num} error: {e}")
+            failed_batches += 1
+        
+        # Small delay between batches
+        if i + EMBEDDING_BATCH_SIZE < len(contents):
+            time.sleep(0.2)
+    
+    print(f"✓ Generated {len(results)} embeddings, {failed_batches} batches failed")
     context['task_instance'].xcom_push(key='embeddings', value=results)
     return len(results)
 
@@ -220,35 +270,100 @@ with DAG(
     This DAG generates embeddings for documents in the Iceberg Gold layer,
     enabling vector search directly via Trino without needing DuckDB.
     
+    ### Architecture
+    
+    **Embedding compute runs on FastAPI container, not Airflow.**
+    
+    ```
+    Airflow                    FastAPI
+    ┌──────────────────┐      ┌──────────────────┐
+    │ 1. Query Trino   │      │                  │
+    │ 2. Get docs      │─────▶│ 3. /embed/batch  │
+    │ 4. Write to      │◀─────│    (ML compute)  │
+    │    Iceberg       │      │                  │
+    └──────────────────┘      └──────────────────┘
+    ```
+    
+    Benefits:
+    - No model loading in Airflow
+    - Centralized ML compute
+    - Model stays warm for real-time requests
+    
     ### Tasks
     
-    1. **get_documents_without_embeddings**: Query Iceberg for docs missing embeddings
-    2. **generate_embeddings**: Use sentence-transformers to create 384-dim vectors
-    3. **write_embeddings_to_iceberg**: Update Iceberg table with embeddings
-    4. **verify_embeddings**: Confirm embedding coverage
+    1. **get_documents_without_embeddings**: Query Iceberg via Trino
+    2. **generate_embeddings**: Call FastAPI /embed/batch endpoint
+    3. **write_embeddings_to_iceberg**: Update Iceberg via Trino
+    4. **compact_gold_table**: Compact small files from UPDATEs
+    5. **verify_embeddings**: Confirm embedding coverage
     
-    ### Usage
+    ### Configuration
     
-    Run this DAG after `dbt_manual_transforms` completes to add embeddings
-    to the Gold layer. Then query directly via Trino:
-    
-    ```sql
-    -- Cosine similarity search in Trino
-    SELECT id, content,
-           reduce(
-               zip_with(embedding, query_vec, (a, b) -> a * b),
-               0.0, (s, x) -> s + x, s -> s
-           ) / (
-               sqrt(reduce(embedding, 0.0, (s, x) -> s + x*x, s -> s)) *
-               sqrt(reduce(query_vec, 0.0, (s, x) -> s + x*x, s -> s))
-           ) as similarity
-    FROM iceberg.gold.gold_documents
-    WHERE embedding IS NOT NULL
-    ORDER BY similarity DESC
-    LIMIT 10;
-    ```
+    - `FASTAPI_URL`: FastAPI endpoint (default: http://fastapi:8000)
+    - `EMBEDDING_BATCH_SIZE`: Docs per batch request (default: 32)
     """,
 ) as dag:
+    
+    def compact_gold_table(**context):
+        """
+        Compact Gold table after embedding updates to address small files problem.
+        
+        UPDATEs in Iceberg create new data files. Frequent embedding updates
+        can create many small files. This compacts them for better performance.
+        """
+        conn = get_trino_connection()
+        cursor = conn.cursor()
+        
+        table = "iceberg.silver_gold.gold_documents"
+        
+        try:
+            # Check file count and average size
+            cursor.execute(f"""
+                SELECT 
+                    COUNT(*) as file_count,
+                    AVG(file_size_in_bytes) / 1024 / 1024 as avg_size_mb
+                FROM "{table}$files"
+            """)
+            row = cursor.fetchone()
+            
+            if row and row[0] > 0:
+                file_count = row[0]
+                avg_size = round(row[1], 2) if row[1] else 0
+                
+                # Skip if already optimal
+                if avg_size >= 100 or file_count < 5:
+                    print(f"⏭ {table}: {file_count} files, avg {avg_size}MB - already optimal")
+                    return {"skipped": True, "reason": "already optimal"}
+                
+                print(f"🔄 {table}: {file_count} files, avg {avg_size}MB - compacting...")
+                
+                # Try optimize first
+                try:
+                    cursor.execute(f"""
+                        ALTER TABLE {table} EXECUTE optimize
+                        WHERE file_size_in_bytes < 134217728
+                    """)
+                    print(f"✓ {table}: Compaction complete")
+                except Exception:
+                    # Fallback to rewrite_data_files
+                    try:
+                        cursor.execute(f"CALL iceberg.system.rewrite_data_files(table => '{table}')")
+                        print(f"✓ {table}: Compaction via rewrite_data_files complete")
+                    except Exception as e2:
+                        print(f"⚠ {table}: Compaction skipped - {e2}")
+                        return {"skipped": True, "reason": str(e2)}
+                
+                return {"compacted": True}
+            else:
+                print(f"⏭ {table}: No files to compact")
+                return {"skipped": True, "reason": "no files"}
+                
+        except Exception as e:
+            print(f"⚠ {table}: Could not analyze/compact - {e}")
+            return {"error": str(e)}
+        finally:
+            cursor.close()
+            conn.close()
     
     get_docs = PythonOperator(
         task_id='get_documents_without_embeddings',
@@ -265,9 +380,14 @@ with DAG(
         python_callable=write_embeddings_to_iceberg,
     )
     
+    compact = PythonOperator(
+        task_id='compact_gold_table',
+        python_callable=compact_gold_table,
+    )
+    
     verify = PythonOperator(
         task_id='verify_embeddings',
         python_callable=verify_embeddings,
     )
     
-    get_docs >> gen_embeddings >> write_embeddings >> verify
+    get_docs >> gen_embeddings >> write_embeddings >> compact >> verify

@@ -176,12 +176,25 @@ Embeddings are generated automatically when indexing documents via the API.
 
 ## Airflow DAGs
 
-| DAG | Purpose | Output |
-|-----|---------|--------|
-| `dbt_seed_bronze_data` | Create Bronze table with sample data | Iceberg Bronze layer |
-| `dbt_manual_transforms` | Run dbt Bronze → Silver → Gold | Iceberg Silver/Gold layers |
-| `embed_iceberg_gold` | Generate embeddings for Gold layer | Embeddings in Iceberg |
-| `daily_reindex` | Build DuckDB HNSW index + S3 backup | HNSW index, parquet backup |
+| DAG | Purpose | Schedule |
+|-----|---------|----------|
+| `dbt_seed_bronze_data` | Create Bronze table with sample data | Manual |
+| `dbt_manual_transforms` | Run dbt Bronze → Silver → Gold + compaction | Daily 1 AM |
+| `embed_iceberg_gold` | Generate embeddings for Gold layer + compaction | Manual |
+| `daily_reindex` | Build DuckDB HNSW index + S3 backup | Daily 2 AM |
+| `iceberg_maintenance` | Full table optimization (compaction, cleanup) | Daily 3 AM |
+
+### Small Files Problem
+
+The `iceberg_maintenance` DAG addresses the **small files problem** common in data lakes:
+
+| Task | Purpose |
+|------|---------|
+| `compact_small_files` | Merge small files into 128MB target size |
+| `expire_old_snapshots` | Remove snapshots older than 7 days |
+| `remove_orphan_files` | Clean up unreferenced data files |
+
+Compaction also runs automatically after dbt transforms and embedding generation.
 
 ## Data Pipeline
 

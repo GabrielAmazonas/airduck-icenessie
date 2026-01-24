@@ -199,6 +199,70 @@ CAST(json_parse('[0.1, 0.2, ...]') AS ARRAY(REAL))
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### 5. Iceberg Table Maintenance (Small Files Problem)
+
+**The Problem:** Frequent writes, updates, and streaming ingestion create many small files:
+
+| Root Cause | Result |
+|------------|--------|
+| Frequent INSERTs | 1 file per write batch |
+| UPDATE statements | Copy-on-write creates new files |
+| Many partitions | Few rows per partition file |
+| Streaming ingestion | Micro-batches = micro-files |
+
+**Impact on Performance:**
+
+| Files per Table | Query Planning | S3 API Calls | Query Time |
+|-----------------|----------------|--------------|------------|
+| 10 | Fast | Low | Fast |
+| 1,000 | Slow | High | 10-100x slower |
+| 10,000+ | Very slow | Very high | Unusable |
+
+**Solution: Iceberg Maintenance Procedures**
+
+The `iceberg_maintenance` DAG runs these procedures:
+
+```sql
+-- 1. Compact small files into target size (128MB)
+ALTER TABLE iceberg.silver_gold.gold_documents EXECUTE optimize
+WHERE file_size_in_bytes < 134217728;
+
+-- Alternative for older Trino versions:
+CALL iceberg.system.rewrite_data_files(
+    table => 'iceberg.silver_gold.gold_documents'
+);
+
+-- 2. Expire old snapshots (enables garbage collection)
+CALL iceberg.system.expire_snapshots(
+    table => 'iceberg.silver_gold.gold_documents',
+    older_than => TIMESTAMP '2026-01-17 00:00:00',
+    retain_last => 2
+);
+
+-- 3. Remove orphan files (unreferenced data)
+CALL iceberg.system.remove_orphan_files(
+    table => 'iceberg.silver_gold.gold_documents',
+    older_than => TIMESTAMP '2026-01-21 00:00:00'
+);
+```
+
+**Maintenance Schedule:**
+
+| DAG | Compaction | When |
+|-----|------------|------|
+| `dbt_manual_transforms` | After dbt run | On transform |
+| `embed_iceberg_gold` | After embedding update | On embedding |
+| `iceberg_maintenance` | Full optimization | Daily 3 AM |
+
+**Target File Sizes:**
+
+| File Size | Assessment | Action |
+|-----------|------------|--------|
+| < 10 MB | Too small | Compact immediately |
+| 10-100 MB | Acceptable | Compact opportunistically |
+| 100-256 MB | Optimal | No action needed |
+| > 256 MB | Large but OK | May slow writes |
+
 ---
 
 ## Scaling Analysis: A Principal Engineer's Perspective

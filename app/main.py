@@ -645,14 +645,54 @@ async def list_s3_documents(path: str = "backup/documents", limit: int = 20):
         conn.close()
 
 
+class EmbedRequest(BaseModel):
+    """Single text embedding request."""
+    text: str
+
+
+class EmbedBatchRequest(BaseModel):
+    """Batch text embedding request."""
+    texts: List[str]
+
+
 @app.post("/embed")
-async def generate_embedding_endpoint(text: str):
-    """Generate embedding for a text (utility endpoint)."""
-    embedding = generate_embedding(text)
+async def generate_embedding_endpoint(request: EmbedRequest):
+    """Generate embedding for a single text."""
+    embedding = generate_embedding(request.text)
     return {
-        "text": text,
+        "text": request.text,
         "embedding": embedding,
         "dim": len(embedding),
+        "model": EMBEDDING_MODEL,
+    }
+
+
+@app.post("/embed/batch")
+async def generate_embeddings_batch(request: EmbedBatchRequest):
+    """
+    Generate embeddings for multiple texts in a single request.
+    
+    More efficient than multiple /embed calls for batch processing.
+    Used by Airflow embed_iceberg_gold DAG.
+    """
+    if not request.texts:
+        return {"embeddings": [], "count": 0}
+    
+    if len(request.texts) > 100:
+        raise HTTPException(
+            status_code=400, 
+            detail="Maximum 100 texts per batch request"
+        )
+    
+    embeddings = []
+    for text in request.texts:
+        emb = generate_embedding(text)
+        embeddings.append(emb)
+    
+    return {
+        "embeddings": embeddings,
+        "count": len(embeddings),
+        "dim": EMBEDDING_DIM,
         "model": EMBEDDING_MODEL,
     }
 

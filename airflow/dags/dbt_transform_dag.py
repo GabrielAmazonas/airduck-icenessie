@@ -147,6 +147,78 @@ def create_bronze_table_if_not_exists(**context):
     conn.close()
 
 
+def compact_iceberg_tables(**context):
+    """
+    Compact small files after dbt transforms to address the Small Files Problem.
+    
+    dbt transforms often create many small files. This compacts them into
+    larger files (target: 128MB) for better query performance and lower S3 costs.
+    """
+    import trino
+    
+    conn = trino.dbapi.connect(
+        host=TRINO_HOST,
+        port=int(TRINO_PORT),
+        user="airflow",
+        catalog="iceberg",
+    )
+    cursor = conn.cursor()
+    
+    # Tables modified by dbt transforms
+    tables_to_compact = [
+        "iceberg.silver_silver.silver_documents",
+        "iceberg.silver_gold.gold_documents",
+    ]
+    
+    print("🔄 Compacting Iceberg tables to address small files problem...")
+    
+    for table in tables_to_compact:
+        try:
+            # Check file count and average size
+            cursor.execute(f"""
+                SELECT 
+                    COUNT(*) as file_count,
+                    AVG(file_size_in_bytes) / 1024 / 1024 as avg_size_mb
+                FROM "{table}$files"
+            """)
+            row = cursor.fetchone()
+            
+            if row and row[0] > 0:
+                file_count = row[0]
+                avg_size = round(row[1], 2) if row[1] else 0
+                
+                # Skip if already optimal (avg > 100MB or few files)
+                if avg_size >= 100 or file_count < 5:
+                    print(f"⏭ {table}: {file_count} files, avg {avg_size}MB - already optimal")
+                    continue
+                
+                print(f"🔄 {table}: {file_count} files, avg {avg_size}MB - compacting...")
+                
+                # Try optimize first (Trino 4xx+)
+                try:
+                    cursor.execute(f"""
+                        ALTER TABLE {table} EXECUTE optimize
+                        WHERE file_size_in_bytes < 134217728
+                    """)
+                    print(f"✓ {table}: Compaction complete")
+                except Exception:
+                    # Fallback to rewrite_data_files
+                    try:
+                        cursor.execute(f"CALL iceberg.system.rewrite_data_files(table => '{table}')")
+                        print(f"✓ {table}: Compaction via rewrite_data_files complete")
+                    except Exception as e2:
+                        print(f"⚠ {table}: Compaction skipped - {e2}")
+            else:
+                print(f"⏭ {table}: No files to compact")
+                
+        except Exception as e:
+            print(f"⚠ {table}: Could not analyze - {e}")
+    
+    cursor.close()
+    conn.close()
+    print("✓ Compaction check complete")
+
+
 def log_dbt_run_summary(**context):
     """Log summary after dbt run."""
     ti = context['ti']
@@ -163,6 +235,7 @@ def log_dbt_run_summary(**context):
     print("Next Steps:")
     print("  - Run the 'daily_reindex' DAG to build HNSW vector indexes")
     print("  - Or wait for scheduled trigger from 'dbt_pipeline_with_reindex'")
+    print("  - Run 'iceberg_maintenance' DAG for full table optimization")
     print("=" * 60)
 
 
@@ -318,6 +391,12 @@ with DAG(
         """,
     )
 
+    # Compact small files after transforms
+    compact_tables = PythonOperator(
+        task_id="compact_iceberg_tables",
+        python_callable=compact_iceberg_tables,
+    )
+
     # Log summary
     log_summary = PythonOperator(
         task_id="log_summary",
@@ -339,6 +418,7 @@ with DAG(
         >> dbt_gold
         >> dbt_test
         >> dbt_docs
+        >> compact_tables
         >> log_summary
         >> end
     )
@@ -421,6 +501,12 @@ with DAG(
         """,
     )
 
+    # Compact small files after transforms
+    compact_pipeline = PythonOperator(
+        task_id="compact_iceberg_tables",
+        python_callable=compact_iceberg_tables,
+    )
+
     # Trigger the reindex DAG
     trigger_reindex = TriggerDagRunOperator(
         task_id="trigger_vector_reindex",
@@ -447,6 +533,7 @@ with DAG(
         >> ensure_infra
         >> run_dbt_all
         >> verify_gold
+        >> compact_pipeline
         >> trigger_reindex
         >> log_pipeline_complete
         >> pipeline_end
