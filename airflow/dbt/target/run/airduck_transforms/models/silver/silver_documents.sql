@@ -2,7 +2,7 @@
   
     
 
-    create table "iceberg"."silver_silver"."silver_documents"
+    create table "iceberg"."silver_silver"."silver_documents__dbt_tmp"
       
       
     as (
@@ -26,6 +26,8 @@ WITH raw AS (
         -- Deduplication hash (case-insensitive, trimmed)
         TO_HEX(SHA256(TO_UTF8(LOWER(TRIM(content))))) as content_hash
     FROM "iceberg"."bronze"."raw_documents"
+    
+    
     
 ),
 

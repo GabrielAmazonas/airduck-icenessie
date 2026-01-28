@@ -1,8 +1,8 @@
 {{
   config(
-    materialized='incremental',
-    unique_key='content_hash',
-    incremental_strategy='merge',
+    materialized='table',
+    
+    
     file_format='parquet'
   )
 }}
@@ -25,9 +25,9 @@ WITH raw AS (
         -- Deduplication hash (case-insensitive, trimmed)
         TO_HEX(SHA256(TO_UTF8(LOWER(TRIM(content))))) as content_hash
     FROM {{ source('bronze', 'raw_documents') }}
-    {% if is_incremental() %}
-    WHERE ingested_at > (SELECT COALESCE(MAX(processed_at), TIMESTAMP '1970-01-01') FROM {{ this }})
-    {% endif %}
+    
+    
+    
 ),
 
 deduplicated AS (

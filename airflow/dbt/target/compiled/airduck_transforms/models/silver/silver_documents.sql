@@ -19,7 +19,7 @@ WITH raw AS (
         TO_HEX(SHA256(TO_UTF8(LOWER(TRIM(content))))) as content_hash
     FROM "iceberg"."bronze"."raw_documents"
     
-    WHERE ingested_at > (SELECT COALESCE(MAX(processed_at), TIMESTAMP '1970-01-01') FROM "iceberg"."silver_silver"."silver_documents")
+    
     
 ),
 
