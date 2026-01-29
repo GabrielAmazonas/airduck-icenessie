@@ -17,7 +17,7 @@ interface IndexStatus {
   has_vector_index?: boolean
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:80'
 
 export default function Home() {
   const [query, setQuery] = useState('')
