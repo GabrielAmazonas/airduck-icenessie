@@ -30,7 +30,8 @@ S3_BUCKET = "rag-data"
 
 # Iceberg configuration
 ICEBERG_WAREHOUSE = "iceberg-warehouse"
-USE_ICEBERG_SOURCE = os.getenv("USE_ICEBERG_SOURCE", "false").lower() == "true"
+# Default to true - Iceberg is the source of truth for embeddings
+USE_ICEBERG_SOURCE = os.getenv("USE_ICEBERG_SOURCE", "true").lower() == "true"
 
 # Embedding configuration (must match FastAPI)
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
@@ -130,10 +131,15 @@ def _ingest_from_current_index(con) -> int:
 
 def _ingest_from_iceberg_gold(con) -> int:
     """
-    Ingest documents from Iceberg Gold layer.
+    Ingest documents WITH embeddings from Iceberg Gold layer.
     
     The Gold layer contains chunked, scored, vector-ready documents
-    processed by dbt transformations via Trino.
+    processed by dbt transformations via Trino, with embeddings generated
+    by the embed_iceberg_gold DAG.
+    
+    IMPORTANT: This copies embeddings from Iceberg (single source of truth)
+    rather than regenerating them. This ensures DuckDB and Iceberg have
+    identical embeddings for consistent search results across both lanes.
     
     Returns the number of documents ingested.
     """
@@ -141,7 +147,9 @@ def _ingest_from_iceberg_gold(con) -> int:
     
     # Path to the Iceberg Gold table metadata
     # DuckDB's iceberg extension reads the metadata.json to find data files
-    iceberg_gold_path = f"s3://{ICEBERG_WAREHOUSE}/gold/gold_documents"
+    # Note: dbt-trino creates schemas as {target_schema}_{model_schema}
+    # So gold models end up in silver_gold schema
+    iceberg_gold_path = f"s3://{ICEBERG_WAREHOUSE}/silver_gold/gold_documents"
     
     try:
         # Try to read from Iceberg table
@@ -153,12 +161,21 @@ def _ingest_from_iceberg_gold(con) -> int:
             doc_count = result[0]
             print(f"Found {doc_count} documents in Iceberg Gold, ingesting...")
             
-            # Insert from Iceberg Gold - map columns to our schema
+            # Check how many have embeddings
+            emb_result = con.execute(f"""
+                SELECT COUNT(*) FROM iceberg_scan('{iceberg_gold_path}')
+                WHERE embedding IS NOT NULL
+            """).fetchone()
+            emb_count = emb_result[0] if emb_result else 0
+            print(f"  - {emb_count} documents have embeddings in Iceberg")
+            
+            # Insert from Iceberg Gold - INCLUDING embeddings (single source of truth)
             con.execute(f"""
-                INSERT INTO documents (id, content, metadata, source_file, created_at)
+                INSERT INTO documents (id, content, embedding, metadata, source_file, created_at)
                 SELECT 
                     id,
                     content,
+                    embedding::FLOAT[{EMBEDDING_DIM}],
                     metadata::JSON,
                     COALESCE(source, 'iceberg_gold') as source_file,
                     COALESCE(ready_at, CURRENT_TIMESTAMP) as created_at
@@ -166,6 +183,7 @@ def _ingest_from_iceberg_gold(con) -> int:
                 WHERE content IS NOT NULL
             """)
             
+            print(f"Ingested {doc_count} documents with embeddings from Iceberg Gold")
             return doc_count
         else:
             print("Iceberg Gold table is empty")
@@ -286,7 +304,11 @@ def build_and_swap_index(**context):
         _insert_sample_data(con)
         doc_count = con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     
-    # 4. Generate embeddings for documents without them
+    # 4. Generate embeddings ONLY for documents without them
+    # This is a fallback - embeddings should come from Iceberg (single source of truth)
+    # Only generates locally if:
+    #   - Document was added via UI (not in Iceberg yet)
+    #   - Iceberg document didn't have embedding (embed_iceberg_gold DAG not run)
     _generate_missing_embeddings(con)
     
     # 5. Build HNSW vector index for fast similarity search
@@ -492,16 +514,31 @@ with DAG(
     
     Controlled by `USE_ICEBERG_SOURCE` environment variable:
     
-    - **`false` (default)**: Read from S3 parquet files (`s3://rag-data/documents/`)
-    - **`true`**: Read from Iceberg Gold layer (`s3://iceberg-warehouse/gold/`)
+    - **`true` (default)**: Read from Iceberg Gold layer (`s3://iceberg-warehouse/silver_gold/gold_documents`)
+    - **`false`**: Read from S3 parquet files (`s3://rag-data/documents/`) - legacy mode
     
-    When using Iceberg source, the DAG reads from the Gold layer populated by
-    dbt transformations (via `dbt_manual_transforms` or `dbt_cosmos_transforms`).
+    ### Embedding Strategy (Single Source of Truth)
+    
+    When `USE_ICEBERG_SOURCE=true`, embeddings are **copied from Iceberg**, not regenerated:
+    
+    ```
+    embed_iceberg_gold DAG    →    Iceberg Gold (S3)    →    daily_reindex DAG    →    DuckDB (EFS)
+         (generate)                 (source of truth)           (copy)                 (replica)
+    ```
+    
+    This ensures:
+    - **Identical embeddings** across both search lanes (DuckDB and Trino)
+    - **Consistent results** for `/search` and `/search/iceberg` endpoints
+    - **No drift** from model version differences or timing
+    
+    Local embedding generation only happens as a fallback for:
+    - Documents added via UI (not yet in Iceberg)
+    - Documents in Iceberg without embeddings
     
     ### Data Flow with Iceberg
     
     ```
-    Bronze (raw) → Silver (dedupe) → Gold (chunked/scored) → HNSW Index → FastAPI
+    Bronze (raw) → Silver (dedupe) → Gold (chunked/scored + embeddings) → HNSW Index → FastAPI
     ```
     
     ### Why Reindexing is Required

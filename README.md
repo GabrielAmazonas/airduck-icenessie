@@ -8,51 +8,47 @@ A modern data stack proposal for handling Embeddings on data laheouses. Unlocks 
 
 ## Overview
 
-This architecture demonstrates how to build a production-ready RAG system without proprietary vector databases:
+This architecture demonstrates how to build a RAG system without proprietary vector databases, featuring a **dual-lane vector search strategy**:
 
-- **DuckDB + VSS** for embedded vector search with optional HNSW indexing
-- **Trino** as federated SQL query engine with vector search capability
-- **Apache Iceberg + Nessie** for open table format and catalog on data lakehouse
-- **dbt** for medallion architecture transformations (Bronze → Silver → Gold)
-- **Apache Airflow** for orchestration
-- **MinIO** as S3-compatible object storage
+- **DuckDB + VSS** — Low-latency lane (<10ms) for real-time RAG chat interfaces
+- **Trino + Iceberg** — Governance lane for auditable batch comparisons and compliance
+- **Apache Iceberg + Nessie** — Open table format with Git-like versioning (source of truth)
+- **dbt** — Medallion architecture transformations (Bronze → Silver → Gold)
+- **Apache Airflow** — Orchestration for embeddings and index synchronization
+- **MinIO** — S3-compatible object storage
+
+**Key Feature:** Both search lanes produce **identical results** (verified to 6 decimal places) because embeddings are generated once in Iceberg and indexed to DuckDB.
 
 > For detailed architecture documentation, see [ARCHITECTURE.md](./ARCHITECTURE.md)
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    A[👤 User Query] --> B[🖥️ Next.js Frontend<br/>Port 3000]
+    B --> C[⚡ FastAPI<br/>Port 8000]
+    C --> D{🔀 Dual-Lane Router}
+
+    D --> E[🚀 /search<br/>Low-Latency Lane]
+    D --> F[🔍 /search/iceberg<br/>Governance Lane]
+
+    E --> G[🦆 DuckDB HNSW<br/>EFS Index]
+    F --> H[📊 Trino<br/>Port 8085]
+
+    H --> I[🌲 Nessie<br/>Port 19120]
+    I --> J[❄️ Iceberg Tables]
+    J --> K[📦 MinIO S3<br/>Port 9000]
+
+    L[⚙️ Airflow :8080] --> M[dbt_transforms]
+    L --> N[embed_iceberg_gold]
+    L --> O[daily_reindex]
+
+    M --> H
+    N --> J
+    O --> G
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            PRESENTATION LAYER                                │
-│  ┌─────────────────┐     ┌─────────────────┐                                │
-│  │   Next.js UI    │────▶│  FastAPI + RAG  │◀──── Vector Search API         │
-│  │    (3000)       │     │     (8000)      │      /search, /search/iceberg  │
-│  └─────────────────┘     └────────┬────────┘                                │
-├────────────────────────────────────┼────────────────────────────────────────┤
-│                         VECTOR SEARCH OPTIONS                                │
-│            ┌───────────────────────┴───────────────────────┐                │
-│            ▼                                               ▼                │
-│  ┌─────────────────────────┐                 ┌─────────────────────────┐   │
-│  │     DuckDB (EFS)        │                 │    Trino → Iceberg      │   │
-│  │  • Brute force (default)│                 │  • Query Gold layer     │   │
-│  │  • HNSW index (optional)│                 │  • Cosine similarity    │   │
-│  │  • Real-time indexing   │                 │  • Scales with workers  │   │
-│  └─────────────────────────┘                 └─────────────────────────┘   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                            ORCHESTRATION                                     │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                         Apache Airflow                                 │  │
-│  │  • daily_reindex (HNSW)    • embed_iceberg_gold    • dbt transforms   │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                            DATA LAKEHOUSE                                    │
-│  ┌────────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐   │
-│  │     Trino      │──│     Nessie      │──│         MinIO (S3)          │   │
-│  │    (8085)      │  │ Iceberg Catalog │  │  iceberg-warehouse/         │   │
-│  │  dbt-trino     │  │    (19120)      │  │  rag-data/                  │   │
-│  └────────────────┘  └─────────────────┘  └─────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+
+> See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed diagrams and scaling guide.
 
 ## Services
 
@@ -97,22 +93,23 @@ docker compose down
 | Nessie UI | http://localhost:19120 | - |
 | MinIO Console | http://localhost:9001 | `minioadmin` / `minioadmin` |
 
-## Vector Search Endpoints
+## Dual-Lane Vector Search
 
-The system provides multiple search paths optimized for different use cases:
+The system provides **two search paths** with **identical results** (verified to 6 decimal places):
 
-### `/search` - DuckDB Vector Search
+| Lane | Endpoint | Latency | Use Case |
+|------|----------|---------|----------|
+| **Low-Latency** | `/search` | <10ms | RAG chat, autocomplete, real-time |
+| **Governance** | `/search/iceberg` | ~500ms | Audits, compliance, batch reports |
+
+> See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed comparison and lane selection guide.
+
+### `/search` - DuckDB (Low-Latency Lane)
 
 ```bash
-# Brute-force cosine similarity (default)
 curl -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
   -d '{"query": "vector databases", "top_k": 5}'
-
-# HNSW-accelerated search (requires daily_reindex DAG)
-curl -X POST http://localhost:8000/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "vector databases", "top_k": 5, "use_hnsw": true}'
 ```
 
 | Parameter | Type | Default | Description |
@@ -122,9 +119,7 @@ curl -X POST http://localhost:8000/search \
 | `use_vector` | bool | true | Use vector search (false = text search) |
 | `use_hnsw` | bool | false | Use HNSW index for O(log n) performance |
 
-### `/search/iceberg` - Trino/Iceberg Vector Search
-
-Query embeddings directly from the Iceberg Gold layer via Trino:
+### `/search/iceberg` - Trino (Governance Lane)
 
 ```bash
 curl -X POST http://localhost:8000/search/iceberg \
@@ -134,10 +129,18 @@ curl -X POST http://localhost:8000/search/iceberg \
 
 **Benefits:**
 - Queries the data lakehouse directly (source of truth)
+- Time-travel queries for reproducible audits
 - Scales with Trino workers
-- No separate index to maintain
+- Full SQL flexibility for complex analytics
 
-**Requires:** `embed_iceberg_gold` DAG to have run
+### Embedding Consistency (Single Source of Truth)
+
+```
+embed_iceberg_gold DAG → Iceberg Gold (S3) → daily_reindex DAG → DuckDB (EFS)
+     (generate once)      (source of truth)      (copy verbatim)    (replica)
+```
+
+Embeddings are generated **once** in Iceberg via `embed_iceberg_gold`, then **copied** to DuckDB via `daily_reindex`. This guarantees identical search results across both lanes.
 
 ### Search Performance Comparison
 
@@ -145,7 +148,7 @@ curl -X POST http://localhost:8000/search/iceberg \
 |----------|--------|------------|----------|
 | `/search` (default) | Brute force | O(n) | Real-time docs, <100k vectors |
 | `/search?use_hnsw=true` | HNSW index | O(log n) | Large datasets, batch-indexed |
-| `/search/iceberg` | Trino SQL | O(n) | Data lake queries, audit trail |
+| `/search/iceberg` | Trino SQL | O(n) | Audit trail, complex queries |
 
 ## API Endpoints
 
@@ -184,8 +187,8 @@ Embeddings are generated automatically when indexing documents via the API.
 |-----|---------|----------|
 | `dbt_seed_bronze_data` | Create Bronze table with sample data | Manual |
 | `dbt_manual_transforms` | Run dbt Bronze → Silver → Gold + compaction | Daily 1 AM |
-| `embed_iceberg_gold` | Generate embeddings for Gold layer + compaction | Manual |
-| `daily_reindex` | Build DuckDB HNSW index + S3 backup | Daily 2 AM |
+| `embed_iceberg_gold` | Generate embeddings for Gold layer (source of truth) | Manual |
+| `daily_reindex` | Copy embeddings from Iceberg to DuckDB HNSW index | Daily 2 AM |
 | `iceberg_maintenance` | Full table optimization (compaction, cleanup) | Daily 3 AM |
 
 ### Small Files Problem
@@ -202,14 +205,13 @@ Compaction also runs automatically after dbt transforms and embedding generation
 
 ## Data Pipeline
 
-The system uses a **medallion architecture** for data quality:
+The system uses a **medallion architecture** (Bronze → Silver → Gold) with Iceberg as the single source of truth. Embeddings are generated once in Iceberg via `embed_iceberg_gold` and copied to DuckDB via `daily_reindex`.
 
-```
-Bronze (raw)  →  Silver (cleaned)  →  Gold (enriched)  →  Embeddings
-     ↓                ↓                    ↓                  ↓
- Raw ingestion   Deduplicated        Chunked, scored    384-dim vectors
-                 SHA256 hashed       ready for embedding
-```
+| Layer | Purpose | Transformations |
+|-------|---------|-----------------|
+| Bronze | Raw ingestion | None |
+| Silver | Cleaned data | Deduplication, SHA256 hashing |
+| Gold | Search-ready | Chunking, scoring, 384-dim embeddings |
 
 dbt transformations run on Trino, with Iceberg tables stored in MinIO.
 
@@ -298,3 +300,8 @@ The `iceberg-init` container automatically recreates Iceberg schemas on startup.
 ## License
 
 MIT
+
+---
+
+*Last updated: 2026-01-28*  
+*Dual-lane consistency verified with identical scores to 6 decimal places*
